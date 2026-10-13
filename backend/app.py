@@ -1,24 +1,25 @@
+import asyncio
 import base64
 import binascii
 import csv
 import io
+import logging
 import os
+import random
 import sqlite3
 import json
 import re
-import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr, Field
 
 load_dotenv()
-
-logger = logging.getLogger(__name__)
 
 DB_PATH = os.getenv("DATABASE_PATH", "./email_automation.db")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
@@ -31,6 +32,21 @@ _DEFAULT_CORS = f"{FRONTEND_ORIGIN},http://localhost:5173,http://127.0.0.1:5173"
 CORS_ORIGINS = [origin.strip().rstrip("/") for origin in os.getenv("CORS_ORIGINS", _DEFAULT_CORS).split(",") if origin.strip()]
 CORS_ORIGIN_REGEX = os.getenv("CORS_ORIGIN_REGEX", "").strip() or None  # e.g. https://.*--your-site\\.netlify\\.app
 MAX_SEND_PER_REQUEST = max(1, min(int(os.getenv("MAX_SEND_PER_REQUEST", "20")), 100))
+
+GEMINI_FALLBACK_MODELS = [m.strip() for m in os.getenv("GEMINI_FALLBACK_MODELS", "").split(",") if m.strip() and m.strip() != GEMINI_MODEL]
+GEMINI_MAX_RETRIES = max(0, min(int(os.getenv("GEMINI_MAX_RETRIES", "2")), 5))          # retries after the first attempt
+GEMINI_TOTAL_TIMEOUT = float(os.getenv("GEMINI_TOTAL_TIMEOUT_SECONDS", "45"))            # hard budget per user request
+GEMINI_REQUEST_TIMEOUT = float(os.getenv("GEMINI_REQUEST_TIMEOUT_SECONDS", "25"))        # per HTTP attempt
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+GEMINI_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+STALE_SENDING_MINUTES = 10
+
+logger = logging.getLogger("email_automation")
+logging.getLogger("httpx").setLevel(logging.WARNING)      # httpx INFO logs print full URLs
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+_gemini_transport = None   # tests inject an httpx.MockTransport here
+_sleep = asyncio.sleep     # tests replace this to avoid real waiting
 
 MAX_ATTACHMENTS = 5
 MAX_ATTACHMENT_TOTAL_BYTES = int(os.getenv("MAX_ATTACHMENT_TOTAL_MB", "3")) * 1024 * 1024  # Brevo limit is ~4 MB per email; keep a safety margin
@@ -107,6 +123,9 @@ def migrate_db():
         cols = [r["name"] for r in con.execute("PRAGMA table_info(campaigns)").fetchall()]
         if "attachments_json" not in cols:
             con.execute("ALTER TABLE campaigns ADD COLUMN attachments_json TEXT NOT NULL DEFAULT '[]'")
+        if "request_id" not in cols:
+            con.execute("ALTER TABLE campaigns ADD COLUMN request_id TEXT")
+        con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_campaigns_request_id ON campaigns(request_id) WHERE request_id IS NOT NULL")
 
 init_db()
 migrate_db()
@@ -154,6 +173,7 @@ class CampaignCreateRequest(BaseModel):
     subject: str = Field(min_length=1, max_length=250)
     body: str = Field(min_length=1, max_length=12000)
     attachments: list[AttachmentIn] = Field(default_factory=list, max_length=MAX_ATTACHMENTS)
+    request_id: Optional[str] = Field(default=None, max_length=64)  # idempotency key: same id never creates a second campaign
 
 def validate_attachments(items) -> list[dict]:
     """Validate type/size and return clean [{name, content}] for Brevo."""
@@ -187,7 +207,7 @@ def root():
 def health():
     return {"ok": True, "gemini_configured": bool(GEMINI_API_KEY),
             "brevo_configured": bool(BREVO_API_KEY and BREVO_SENDER_EMAIL),
-            "max_send_per_request": MAX_SEND_PER_REQUEST,
+            "max_send_per_request": MAX_SEND_PER_REQUEST, "gemini_model": GEMINI_MODEL,
             "max_attachments": MAX_ATTACHMENTS, "max_attachment_mb": MAX_ATTACHMENT_TOTAL_BYTES // (1024 * 1024)}
 
 @app.get("/api/contacts")
@@ -274,40 +294,149 @@ async def upload_contacts(file: UploadFile = File(...)):
         "message": "Contacts imported. Consent was read from the CSV; only use yes when valid permission exists."
     }
 
-async def generate_with_gemini(contact: dict, instruction: str) -> tuple[str, str]:
-    if not GEMINI_API_KEY:
-        raise HTTPException(400, "GEMINI_API_KEY is not configured in backend/.env.")
-    prompt = f"""Create one email draft using the data below.
-Return ONLY valid JSON with keys "subject" and "body". No markdown fences.
-Do not invent facts. Do not imply the recipient has agreed to anything.
-Keep it concise and professional. Do not include deceptive urgency.
-Instruction: {instruction}
-Recipient name: {contact.get('name','')}
-Company: {contact.get('company','')}
-Role: {contact.get('role','')}
-Context supplied by sender: {contact.get('context','')}
-Sender display name: {BREVO_SENDER_NAME}
-"""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-    async with httpx.AsyncClient(timeout=45) as client:
-        response = await client.post(
-            url,
-            params={"key": GEMINI_API_KEY},
-            json={"contents": [{"parts": [{"text": prompt}]}],
-                  "generationConfig": {"temperature": 0.4, "responseMimeType": "application/json"}}
-        )
-    if response.status_code >= 400:
-        detail = response.text[:1000]
-        raise HTTPException(502, f"Gemini API error ({response.status_code}): {detail}")
+class GeminiError(Exception):
+    """Gemini failure with a stable code the frontend can act on."""
+    def __init__(self, status_code, code, message, retryable=False, retry_after=None, transient=False):
+        super().__init__(message)
+        self.status_code, self.code, self.message = status_code, code, message
+        self.retryable, self.retry_after, self.transient = retryable, retry_after, transient
+
+@app.exception_handler(GeminiError)
+async def gemini_error_handler(request, exc: GeminiError):
+    headers = {"Retry-After": str(int(exc.retry_after))} if exc.retry_after else None
+    return JSONResponse(status_code=exc.status_code, headers=headers, content={
+        "detail": exc.message, "code": exc.code, "retryable": exc.retryable, "retry_after": exc.retry_after})
+
+def _safe(text: str, limit: int = 300) -> str:
+    text = (text or "")[:limit].replace("\n", " ")
+    return text.replace(GEMINI_API_KEY, "***") if GEMINI_API_KEY else text
+
+def _retry_after_seconds(response) -> Optional[float]:
+    raw = response.headers.get("retry-after")
     try:
-        text = response.json()["candidates"][0]["content"]["parts"][0]["text"]
-        data = json.loads(text)
+        return min(max(float(raw), 0.0), 20.0) if raw else None
+    except ValueError:
+        return None
+
+def _classify_gemini_response(response) -> GeminiError:
+    status, body = response.status_code, response.text or ""
+    retry_after = _retry_after_seconds(response)
+    if status == 429:
+        return GeminiError(429, "gemini_rate_limited", "Gemini rate limit or quota reached. Wait a minute and retry, or use a manual template.", True, retry_after or 30, True)
+    if status in (500, 502, 503, 504):
+        return GeminiError(503, "gemini_unavailable", "Gemini is temporarily busy (high demand). Retry in a moment, or use a manual template.", True, retry_after, True)
+    if status in (401, 403) or "API_KEY_INVALID" in body or "API key not valid" in body:
+        return GeminiError(502, "gemini_auth_error", "Gemini rejected the API key or permission. Check GEMINI_API_KEY in the backend environment.", False)
+    if status == 404:
+        return GeminiError(502, "gemini_model_not_found", f"Gemini model '{GEMINI_MODEL}' was not found or does not support generateContent. Check GEMINI_MODEL.", False)
+    return GeminiError(502, "gemini_bad_request", f"Gemini rejected the request (HTTP {status}). Shorten the instruction or check GEMINI_MODEL.", False)
+
+async def _gemini_attempts(model: str, prompt: str, deadline: float, max_retries: int) -> str:
+    loop = asyncio.get_running_loop()
+    url = f"{GEMINI_BASE_URL}/models/{model}:generateContent"
+    payload = {"contents": [{"parts": [{"text": prompt}]}],
+               "generationConfig": {"temperature": 0.4, "responseMimeType": "application/json"}}
+    attempt = 0
+    while True:
+        remaining = deadline - loop.time()
+        if remaining < 1:
+            raise GeminiError(504, "gemini_timeout", "Gemini took too long to respond. Please retry, or use a manual template.", True, None, True)
+        try:
+            async with httpx.AsyncClient(timeout=min(GEMINI_REQUEST_TIMEOUT, remaining), transport=_gemini_transport) as client:
+                # API key goes in a header (never in the URL) so it cannot leak into logs.
+                response = await client.post(url, json=payload, headers={"x-goog-api-key": GEMINI_API_KEY})
+        except httpx.TimeoutException:
+            err = GeminiError(504, "gemini_timeout", "Gemini took too long to respond. Please retry, or use a manual template.", True, None, True)
+        except httpx.RequestError as exc:
+            err = GeminiError(503, "gemini_unreachable", "Could not connect to Gemini. Please retry, or use a manual template.", True, None, True)
+            logger.warning("Gemini connection error model=%s type=%s", model, type(exc).__name__)
+        else:
+            if response.status_code < 400:
+                try:
+                    return response.json()["candidates"][0]["content"]["parts"][0]["text"]
+                except (KeyError, IndexError, TypeError, ValueError):
+                    err = GeminiError(502, "gemini_bad_response", "Gemini returned an unexpected response. Please retry.", True, None, True)
+            else:
+                err = _classify_gemini_response(response)
+                logger.warning("Gemini API failed: model=%s attempt=%d status=%s body=%s", model, attempt + 1, response.status_code, _safe(response.text))
+        if not err.transient or attempt >= max_retries:
+            raise err
+        delay = err.retry_after if err.retry_after else min(1.0 * (2 ** attempt), 8.0) + random.uniform(0, 0.5)
+        if delay >= deadline - loop.time() - 1:
+            raise err   # not enough time budget left to wait and retry
+        logger.info("Gemini retry in %.1fs (model=%s attempt=%d code=%s)", delay, model, attempt + 1, err.code)
+        await _sleep(delay)
+        attempt += 1
+
+async def call_gemini(prompt: str) -> tuple[str, str]:
+    """Returns (text, model_used). Bounded retries; optional configured fallback models."""
+    if not GEMINI_API_KEY:
+        raise GeminiError(400, "gemini_not_configured", "GEMINI_API_KEY is not configured. You can still use a manual template.", False)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + GEMINI_TOTAL_TIMEOUT
+    models = [GEMINI_MODEL] + GEMINI_FALLBACK_MODELS
+    last = None
+    for index, model in enumerate(models):
+        try:
+            text = await _gemini_attempts(model, prompt, deadline, GEMINI_MAX_RETRIES if index == 0 else 0)
+            if index:
+                logger.warning("Gemini fallback model used: %s (primary %s was unavailable)", model, GEMINI_MODEL)
+            else:
+                logger.info("Gemini model used: %s", model)
+            return text, model
+        except GeminiError as exc:
+            last = exc
+            if not exc.transient:
+                raise
+            if deadline - loop.time() < 1:
+                break
+    raise last
+
+def parse_subject_body(text: str) -> tuple[str, str]:
+    cleaned = re.sub(r"^```(?:json)?|```$", "", (text or "").strip(), flags=re.MULTILINE).strip()
+    try:
+        data = json.loads(cleaned)
         subject, body = str(data["subject"]).strip(), str(data["body"]).strip()
         if not subject or not body:
-            raise ValueError("Empty subject/body")
+            raise ValueError("empty")
         return subject[:250], body[:12000]
     except Exception:
-        raise HTTPException(502, "Could not parse AI response. Try again or shorten the instruction.")
+        raise GeminiError(502, "gemini_bad_response", "Could not parse Gemini's response. Please retry, or use a manual template.", True)
+
+async def generate_with_gemini(contact: dict, instruction: str) -> tuple[str, str]:
+    prompt = ("Create one email draft using the data below.\n"
+              'Return ONLY valid JSON with keys "subject" and "body". No markdown fences.\n'
+              "Do not invent facts. Do not imply the recipient has agreed to anything.\n"
+              "Keep it concise and professional. Do not include deceptive urgency.\n"
+              f"Instruction: {instruction}\nRecipient name: {contact.get('name','')}\nCompany: {contact.get('company','')}\n"
+              f"Role: {contact.get('role','')}\nContext supplied by sender: {contact.get('context','')}\nSender display name: {BREVO_SENDER_NAME}\n")
+    text, _model = await call_gemini(prompt)
+    return parse_subject_body(text)
+
+@app.get("/api/ai/check")
+async def ai_check():
+    """Verify the configured Gemini model exists and supports generateContent (does not use generation quota)."""
+    info = {"configured": bool(GEMINI_API_KEY), "model": GEMINI_MODEL, "fallback_models": GEMINI_FALLBACK_MODELS,
+            "supported": None, "detail": ""}
+    if not GEMINI_API_KEY:
+        info["detail"] = "GEMINI_API_KEY is not configured."
+        return info
+    try:
+        async with httpx.AsyncClient(timeout=15, transport=_gemini_transport) as client:
+            response = await client.get(f"{GEMINI_BASE_URL}/models/{GEMINI_MODEL}", headers={"x-goog-api-key": GEMINI_API_KEY})
+    except httpx.HTTPError:
+        info["detail"] = "Could not reach Gemini to verify the model."
+        return info
+    if response.status_code == 200:
+        methods = response.json().get("supportedGenerationMethods", [])
+        info["supported"] = "generateContent" in methods
+        info["detail"] = "Model is available." if info["supported"] else "Model does not support generateContent."
+    elif response.status_code == 404:
+        info["supported"], info["detail"] = False, "Model not found. Check GEMINI_MODEL."
+    else:
+        info["detail"] = f"Could not verify model (HTTP {response.status_code})."
+        logger.warning("Gemini model check status=%s body=%s", response.status_code, _safe(response.text))
+    return info
 
 @app.post("/api/drafts/generate")
 async def generate_drafts(payload: GenerateRequest):
@@ -406,64 +535,38 @@ def personalize_template(template: str, contact: dict) -> str:
 
 @app.post("/api/template/generate")
 async def generate_one_template(payload: TemplateGenerateRequest):
-    """Generate one reusable template, not one draft per contact."""
-    if not GEMINI_API_KEY:
-        raise HTTPException(400, "GEMINI_API_KEY is not configured in Render environment variables.")
-    prompt = f"""Create ONE reusable professional recruitment outreach email template.
-Return ONLY valid JSON with keys subject and body. No markdown fences.
-Do not invent facts, claims, urgency, or promises. Keep it concise.
-Use these exact placeholders when personalization is relevant: {{{{name}}}}, {{{{company}}}}, {{{{role}}}}.
-Instruction: {payload.instruction}
-Sender display name: {BREVO_SENDER_NAME}
-"""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-    timeout = httpx.Timeout(connect=20.0, read=120.0, write=30.0, pool=20.0)
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(url, params={"key": GEMINI_API_KEY}, json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": 0.4, "responseMimeType": "application/json"}
-            })
-    except httpx.TimeoutException as exc:
-        logger.exception("Template generation timed out while calling Gemini")
-        raise HTTPException(504, "Gemini took too long to generate the template. Please retry.") from exc
-    except httpx.RequestError as exc:
-        logger.exception("Could not connect to Gemini API for template generation")
-        raise HTTPException(502, "Could not connect to Gemini API. Please try again.") from exc
-    if response.status_code >= 400:
-        # Log the upstream status and response body so Render Logs show the real cause.
-        # Never log the API key.
-        logger.error(
-            "Template generation Gemini API failed: status=%s response=%s",
-            response.status_code,
-            response.text[:800],
-        )
-        raise HTTPException(
-            status_code=502,
-            detail=f"Gemini API error ({response.status_code}): {response.text[:800]}",
-        )
-    try:
-        data = json.loads(response.json()["candidates"][0]["content"]["parts"][0]["text"])
-        subject, body = str(data["subject"]).strip(), str(data["body"]).strip()
-        if not subject or not body:
-            raise ValueError("Empty subject/body")
-        return {"subject": subject[:250], "body": body[:12000]}
-    except Exception as exc:
-        logger.exception("Could not parse Gemini template response")
-        raise HTTPException(502, "Could not parse Gemini template response. Try again.") from exc
+    """Generate one reusable template (optional). Campaigns also work with a manually typed template."""
+    prompt = ("Create ONE reusable professional recruitment outreach email template.\n"
+              "Return ONLY valid JSON with keys subject and body. No markdown fences.\n"
+              "Do not invent facts, claims, urgency, or promises. Keep it concise.\n"
+              "Use these exact placeholders when personalization is relevant: {{name}}, {{company}}, {{role}}.\n"
+              f"Instruction: {payload.instruction}\nSender display name: {BREVO_SENDER_NAME}\n")
+    text, model = await call_gemini(prompt)
+    subject, body = parse_subject_body(text)
+    return {"subject": subject, "body": body, "model": model}
 
 @app.post("/api/campaigns")
 def create_campaign(payload: CampaignCreateRequest):
     if not BREVO_API_KEY or not BREVO_SENDER_EMAIL:
         raise HTTPException(400, "Brevo is not configured. Check Render environment variables.")
+    if not payload.subject.strip() or not payload.body.strip():
+        raise HTTPException(400, "Subject and email body are required.")
     attachments = validate_attachments(payload.attachments)
     timestamp = now()
+    request_id = (payload.request_id or "").strip() or None
     with db() as con:
+        if request_id:
+            existing = con.execute("SELECT id, status, attachments_json FROM campaigns WHERE request_id=?", (request_id,)).fetchone()
+            if existing:
+                total = con.execute("SELECT COUNT(*) n FROM campaign_recipients WHERE campaign_id=?", (existing["id"],)).fetchone()["n"]
+                names = [a["name"] for a in json.loads(existing["attachments_json"] or "[]")]
+                return {"campaign_id": existing["id"], "total": total, "status": existing["status"],
+                        "batch_size": min(MAX_SEND_PER_REQUEST, 20), "attachments": names, "duplicate": True}
         recipients = con.execute("SELECT id FROM contacts WHERE consent=1 ORDER BY id").fetchall()
         if not recipients:
             raise HTTPException(400, "No authorized contacts found. Import contacts and mark permission only where valid consent exists.")
-        cur = con.execute("INSERT INTO campaigns(subject_template,body_template,status,created_at,updated_at,attachments_json) VALUES(?,?, 'queued', ?,?,?)",
-                          (payload.subject.strip(), payload.body.strip(), timestamp, timestamp, json.dumps(attachments)))
+        cur = con.execute("INSERT INTO campaigns(subject_template,body_template,status,created_at,updated_at,attachments_json,request_id) VALUES(?,?, 'queued', ?,?,?,?)",
+                          (payload.subject.strip(), payload.body.strip(), timestamp, timestamp, json.dumps(attachments), request_id))
         campaign_id = cur.lastrowid
         con.executemany("INSERT INTO campaign_recipients(campaign_id,contact_id,status,updated_at) VALUES(?,?,'pending',?)",
                         [(campaign_id, r["id"], timestamp) for r in recipients])
@@ -489,18 +592,28 @@ async def process_campaign(campaign_id: int, payload: CampaignProcessRequest):
         campaign = con.execute("SELECT * FROM campaigns WHERE id=?", (campaign_id,)).fetchone()
         if not campaign:
             raise HTTPException(404, "Campaign not found.")
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=STALE_SENDING_MINUTES)).isoformat()
+        # A batch that died mid-send is marked failed, never re-sent automatically (avoids duplicate emails).
+        con.execute("""UPDATE campaign_recipients SET status='failed', updated_at=?,
+                       error='Interrupted while sending; not retried automatically to avoid a duplicate email.'
+                       WHERE campaign_id=? AND status='sending' AND updated_at<?""", (now(), campaign_id, cutoff))
         rows = con.execute("""SELECT cr.id AS queue_id, c.* FROM campaign_recipients cr
                               JOIN contacts c ON c.id=cr.contact_id
                               WHERE cr.campaign_id=? AND cr.status='pending' AND c.consent=1
                               ORDER BY cr.id LIMIT ?""", (campaign_id, limit)).fetchall()
-        selected = [dict(r) for r in rows]
+        selected = []
+        for row in rows:
+            # Atomic claim: only the request that flips pending -> sending may send this recipient.
+            claimed = con.execute("UPDATE campaign_recipients SET status='sending', error='', updated_at=? WHERE id=? AND status='pending'",
+                                  (now(), row["queue_id"]))
+            if claimed.rowcount == 1:
+                selected.append(dict(row))
         if not selected:
-            con.execute("UPDATE campaigns SET status='completed', updated_at=? WHERE id=?", (now(), campaign_id))
             counts = {r["status"]: r["n"] for r in con.execute(
                 "SELECT status, COUNT(*) n FROM campaign_recipients WHERE campaign_id=? GROUP BY status", (campaign_id,)).fetchall()}
-            return {"campaign_id": campaign_id, "processed": 0, "sent": counts.get("sent", 0), "failed": counts.get("failed", 0), "pending": counts.get("pending", 0), "done": True}
-        for row in selected:
-            con.execute("UPDATE campaign_recipients SET status='sending', error='', updated_at=? WHERE id=?", (now(), row["queue_id"]))
+            if not counts.get("sending", 0):
+                con.execute("UPDATE campaigns SET status='completed', updated_at=? WHERE id=?", (now(), campaign_id))
+            return {"campaign_id": campaign_id, "processed": 0, "sent": counts.get("sent", 0), "failed": counts.get("failed", 0), "pending": counts.get("pending", 0), "done": True, "errors": []}
         con.execute("UPDATE campaigns SET status='sending', updated_at=? WHERE id=?", (now(), campaign_id))
         templates = dict(campaign)
     try:
@@ -508,6 +621,7 @@ async def process_campaign(campaign_id: int, payload: CampaignProcessRequest):
     except ValueError:
         campaign_attachments = []
     sent = failed = 0
+    batch_errors = []
     for contact in selected:
         subject = personalize_template(templates["subject_template"], contact)
         body = personalize_template(templates["body_template"], contact)
@@ -523,6 +637,8 @@ async def process_campaign(campaign_id: int, payload: CampaignProcessRequest):
                 con.execute("UPDATE campaign_recipients SET status='failed', error=?, updated_at=? WHERE id=?",
                             (error, now(), contact["queue_id"]))
             failed += 1
+            if len(batch_errors) < 5:
+                batch_errors.append({"email": contact["email"], "error": error})
     with db() as con:
         counts = {r["status"]: r["n"] for r in con.execute(
             "SELECT status, COUNT(*) n FROM campaign_recipients WHERE campaign_id=? GROUP BY status", (campaign_id,)).fetchall()}
@@ -532,7 +648,15 @@ async def process_campaign(campaign_id: int, payload: CampaignProcessRequest):
         con.execute("UPDATE campaigns SET status=?, updated_at=? WHERE id=?", (status, now(), campaign_id))
     return {"campaign_id": campaign_id, "processed": len(selected), "sent_this_batch": sent,
             "failed_this_batch": failed, "sent": counts.get("sent", 0), "failed": counts.get("failed", 0),
-            "pending": pending, "done": pending == 0 and sending == 0}
+            "pending": pending, "done": pending == 0 and sending == 0, "errors": batch_errors}
+
+@app.get("/api/campaigns/{campaign_id}/failures")
+def campaign_failures(campaign_id: int):
+    with db() as con:
+        rows = con.execute("""SELECT c.email, cr.error FROM campaign_recipients cr
+                              JOIN contacts c ON c.id=cr.contact_id
+                              WHERE cr.campaign_id=? AND cr.status='failed' ORDER BY cr.id LIMIT 200""", (campaign_id,)).fetchall()
+    return [dict(r) for r in rows]
 
 @app.post("/api/send-approved")
 async def send_approved(payload: SendRequest):
