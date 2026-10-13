@@ -27,6 +27,14 @@ async function request(path, options = {}, retries = 0) {
   }
   throw lastErr;
 }
+const ALLOWED_EXT = ["pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "csv", "png", "jpg", "jpeg", "gif", "webp"];
+const fmtSize = (b) => (b >= 1048576 ? (b / 1048576).toFixed(2) + " MB" : Math.max(1, Math.round(b / 1024)) + " KB");
+const fileToBase64 = (file) => new Promise((resolve, reject) => {
+  const reader = new FileReader();
+  reader.onload = () => resolve(String(reader.result).split(",")[1] || "");
+  reader.onerror = () => reject(new Error("Could not read " + file.name));
+  reader.readAsDataURL(file);
+});
 const defaultInstruction = "Write a concise, professional recruitment outreach email. Do not invent facts, claims, or promises. Use {{name}}, {{company}}, and {{role}} placeholders where suitable.";
 
 // Convert API values to renderable text; React cannot render objects such as {name: "..."} directly.
@@ -53,6 +61,7 @@ function App() {
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [progress, setProgress] = useState(null);
+  const [files, setFiles] = useState([]);
 
   async function refresh() {
     try {
@@ -62,6 +71,27 @@ function App() {
   }
   useEffect(() => { refresh(); }, []);
   function showError(e) { setError(e.message || String(e)); setMessage(""); }
+
+  const maxFiles = health?.max_attachments || 5;
+  const maxBytes = (health?.max_attachment_mb || 3) * 1024 * 1024;
+  function addFiles(e) {
+    const picked = Array.from(e.target.files || []);
+    e.target.value = "";
+    if (!picked.length) return;
+    setError(""); setMessage("");
+    const next = [...files];
+    for (const f of picked) {
+      const ext = (f.name.split(".").pop() || "").toLowerCase();
+      if (!ALLOWED_EXT.includes(ext)) { setError(`".${ext}" file allowed nahi hai. Allowed: ${ALLOWED_EXT.join(", ")}`); return; }
+      if (next.some(x => x.name === f.name && x.size === f.size)) continue;
+      next.push(f);
+    }
+    if (next.length > maxFiles) { setError(`Maximum ${maxFiles} files allowed.`); return; }
+    const total = next.reduce((a, f) => a + f.size, 0);
+    if (total > maxBytes) { setError(`Total attachment size ${fmtSize(total)} hai. Limit ${fmtSize(maxBytes)} hai.`); return; }
+    setFiles(next);
+  }
+  function removeFile(index) { setFiles(files.filter((_, i) => i !== index)); }
 
   async function upload(e) {
     const file = e.target.files?.[0]; if (!file) return;
@@ -92,11 +122,12 @@ function App() {
   async function sendCampaign() {
     if (!subject.trim() || !body.trim()) { setError("Generate or enter a subject and email body first."); return; }
     if (!stats.consented_contacts) { setError("No authorized contacts. Import contacts and mark permission only when valid consent exists."); return; }
-    const confirmed = window.confirm(`Start one bulk campaign for ${stats.consented_contacts} authorized contact(s)?\n\nGemini will NOT generate a separate draft per contact. The same template will be personalized with {{name}}, {{company}}, {{role}} and sent in batches.\n\nContinue only if these recipients are authorized and your Brevo plan supports the volume.`);
+    const confirmed = window.confirm(`Start one bulk campaign for ${stats.consented_contacts} authorized contact(s)?\n\nGemini will NOT generate a separate draft per contact. The same template will be personalized with {{name}}, {{company}}, {{role}} and sent in batches.${files.length ? `\n\nAttachments (${files.length}): ${files.map(f => f.name).join(", ")}` : ""}\n\nContinue only if these recipients are authorized and your Brevo plan supports the volume.`);
     if (!confirmed) return;
     setBusy(true); setError(""); setMessage(""); setProgress({ sent: 0, failed: 0, pending: stats.consented_contacts, total: stats.consented_contacts });
     try {
-      const campaign = await request("/campaigns", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ subject, body }) });
+      const attachments = await Promise.all(files.map(async f => ({ name: f.name, content: await fileToBase64(f) })));
+      const campaign = await request("/campaigns", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ subject, body, attachments }) });
       let latest = { sent: 0, failed: 0, pending: campaign.total, total: campaign.total };
       setProgress(latest);
       // Process one small batch per request so a single long HTTP request doesn't handle all 5,000 recipients.
@@ -143,6 +174,15 @@ function App() {
       <div className="action-row"><span>Placeholders: <code>{"{{name}}"}</code> <code>{"{{company}}"}</code> <code>{"{{role}}"}</code></span><button onClick={generateTemplate} disabled={busy}>{busy ? "Working…" : "Generate one template"}</button></div>
       <label className="field-label">Email subject</label><input value={subject} onChange={e => setSubject(e.target.value)} maxLength="250" disabled={busy}/>
       <label className="field-label">Email body</label><textarea rows="10" value={body} onChange={e => setBody(e.target.value)} maxLength="12000" disabled={busy} placeholder="Your reusable email template will appear here…"/>
+      <label className="field-label">Attachments (optional, photo ya file)</label>
+      <div className="attach-box">
+        <label className="upload attach-btn">Add files<input type="file" multiple accept=".pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.png,.jpg,.jpeg,.gif,.webp" onChange={addFiles} disabled={busy}/></label>
+        <span className="attach-hint">Max {maxFiles} files, total {fmtSize(maxBytes)}. Ye files har recipient ko jayengi.</span>
+      </div>
+      {files.length > 0 && <ul className="attach-list">
+        {files.map((f, i) => <li key={f.name + f.size}><span>📎 {f.name} <em>({fmtSize(f.size)})</em></span><button className="secondary" onClick={() => removeFile(i)} disabled={busy}>Remove</button></li>)}
+        <li className="attach-total">Total: {fmtSize(files.reduce((a, f) => a + f.size, 0))}</li>
+      </ul>}
       <div className="notice">Example: “Hi {"{{name}}"}” will be personalized for each recipient. Do not add claims or facts that you cannot verify.</div>
     </section>
     <section className="panel">
