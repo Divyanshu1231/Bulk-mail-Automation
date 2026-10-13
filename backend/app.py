@@ -6,6 +6,7 @@ import os
 import sqlite3
 import json
 import re
+import logging
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -16,6 +17,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 DB_PATH = os.getenv("DATABASE_PATH", "./email_automation.db")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
@@ -422,11 +425,23 @@ Sender display name: {BREVO_SENDER_NAME}
                 "generationConfig": {"temperature": 0.4, "responseMimeType": "application/json"}
             })
     except httpx.TimeoutException as exc:
+        logger.exception("Template generation timed out while calling Gemini")
         raise HTTPException(504, "Gemini took too long to generate the template. Please retry.") from exc
     except httpx.RequestError as exc:
+        logger.exception("Could not connect to Gemini API for template generation")
         raise HTTPException(502, "Could not connect to Gemini API. Please try again.") from exc
     if response.status_code >= 400:
-        raise HTTPException(502, f"Gemini API error ({response.status_code}): {response.text[:800]}")
+        # Log the upstream status and response body so Render Logs show the real cause.
+        # Never log the API key.
+        logger.error(
+            "Template generation Gemini API failed: status=%s response=%s",
+            response.status_code,
+            response.text[:800],
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=f"Gemini API error ({response.status_code}): {response.text[:800]}",
+        )
     try:
         data = json.loads(response.json()["candidates"][0]["content"]["parts"][0]["text"])
         subject, body = str(data["subject"]).strip(), str(data["body"]).strip()
@@ -434,6 +449,7 @@ Sender display name: {BREVO_SENDER_NAME}
             raise ValueError("Empty subject/body")
         return {"subject": subject[:250], "body": body[:12000]}
     except Exception as exc:
+        logger.exception("Could not parse Gemini template response")
         raise HTTPException(502, "Could not parse Gemini template response. Try again.") from exc
 
 @app.post("/api/campaigns")
