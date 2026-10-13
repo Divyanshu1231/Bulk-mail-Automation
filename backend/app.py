@@ -1,3 +1,5 @@
+import base64
+import binascii
 import csv
 import io
 import os
@@ -27,7 +29,11 @@ CORS_ORIGINS = [origin.strip().rstrip("/") for origin in os.getenv("CORS_ORIGINS
 CORS_ORIGIN_REGEX = os.getenv("CORS_ORIGIN_REGEX", "").strip() or None  # e.g. https://.*--your-site\\.netlify\\.app
 MAX_SEND_PER_REQUEST = max(1, min(int(os.getenv("MAX_SEND_PER_REQUEST", "20")), 100))
 
-app = FastAPI(title="AI Email Automation API", version="1.0.0")
+MAX_ATTACHMENTS = 5
+MAX_ATTACHMENT_TOTAL_BYTES = int(os.getenv("MAX_ATTACHMENT_TOTAL_MB", "3")) * 1024 * 1024  # Brevo limit is ~4 MB per email; keep a safety margin
+ALLOWED_ATTACHMENT_EXT = {"pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "csv", "png", "jpg", "jpeg", "gif", "webp"}
+
+app = FastAPI(title="AI Email Automation API", version="1.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -93,7 +99,14 @@ def init_db():
           FOREIGN KEY(contact_id) REFERENCES contacts(id)
         )""")
 
+def migrate_db():
+    with db() as con:
+        cols = [r["name"] for r in con.execute("PRAGMA table_info(campaigns)").fetchall()]
+        if "attachments_json" not in cols:
+            con.execute("ALTER TABLE campaigns ADD COLUMN attachments_json TEXT NOT NULL DEFAULT '[]'")
+
 init_db()
+migrate_db()
 
 def now():
     return datetime.now(timezone.utc).isoformat()
@@ -130,9 +143,35 @@ class SendRequest(BaseModel):
 class TemplateGenerateRequest(BaseModel):
     instruction: str = Field(default="Write a concise, professional recruitment outreach email. Do not invent facts, claims, or promises. Use {{name}}, {{company}}, and {{role}} placeholders where suitable.", max_length=2000)
 
+class AttachmentIn(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    content: str = Field(min_length=1)  # base64 (no data: prefix)
+
 class CampaignCreateRequest(BaseModel):
     subject: str = Field(min_length=1, max_length=250)
     body: str = Field(min_length=1, max_length=12000)
+    attachments: list[AttachmentIn] = Field(default_factory=list, max_length=MAX_ATTACHMENTS)
+
+def validate_attachments(items) -> list[dict]:
+    """Validate type/size and return clean [{name, content}] for Brevo."""
+    clean, total = [], 0
+    for item in items:
+        name = re.sub(r"[^A-Za-z0-9._ \-()]", "_", os.path.basename(item.name.strip())) or "attachment"
+        ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+        if ext not in ALLOWED_ATTACHMENT_EXT:
+            raise HTTPException(400, f"File type .{ext or '?'} is not allowed. Allowed: {', '.join(sorted(ALLOWED_ATTACHMENT_EXT))}.")
+        content = item.content.split(",", 1)[-1].strip()  # tolerate data: URLs
+        try:
+            raw = base64.b64decode(content, validate=True)
+        except (binascii.Error, ValueError):
+            raise HTTPException(400, f"Attachment '{name}' is not valid base64.")
+        if not raw:
+            raise HTTPException(400, f"Attachment '{name}' is empty.")
+        total += len(raw)
+        if total > MAX_ATTACHMENT_TOTAL_BYTES:
+            raise HTTPException(400, f"Attachments are too large. Keep the total under {MAX_ATTACHMENT_TOTAL_BYTES // (1024 * 1024)} MB.")
+        clean.append({"name": name, "content": content})
+    return clean
 
 class CampaignProcessRequest(BaseModel):
     limit: int = Field(default=20, ge=1, le=100)
@@ -145,7 +184,8 @@ def root():
 def health():
     return {"ok": True, "gemini_configured": bool(GEMINI_API_KEY),
             "brevo_configured": bool(BREVO_API_KEY and BREVO_SENDER_EMAIL),
-            "max_send_per_request": MAX_SEND_PER_REQUEST}
+            "max_send_per_request": MAX_SEND_PER_REQUEST,
+            "max_attachments": MAX_ATTACHMENTS, "max_attachment_mb": MAX_ATTACHMENT_TOTAL_BYTES // (1024 * 1024)}
 
 @app.get("/api/contacts")
 def list_contacts():
@@ -328,7 +368,7 @@ def approve_draft(draft_id: int, payload: ApproveRequest):
         con.execute("UPDATE drafts SET status=?, error='', updated_at=? WHERE id=?", (status, now(), draft_id))
     return {"ok": True, "status": status}
 
-async def send_via_brevo(email: str, name: str, subject: str, body: str):
+async def send_via_brevo(email: str, name: str, subject: str, body: str, attachments: Optional[list] = None):
     if not BREVO_API_KEY or not BREVO_SENDER_EMAIL:
         raise HTTPException(400, "Set BREVO_API_KEY and BREVO_SENDER_EMAIL in backend/.env.")
     payload = {
@@ -337,7 +377,9 @@ async def send_via_brevo(email: str, name: str, subject: str, body: str):
         "subject": subject,
         "textContent": body + "\n\nIf you no longer wish to receive recruitment-related emails, please reply asking to be removed from our contact list."
     }
-    async with httpx.AsyncClient(timeout=30) as client:
+    if attachments:
+        payload["attachment"] = [{"name": a["name"], "content": a["content"]} for a in attachments]
+    async with httpx.AsyncClient(timeout=60) as client:
         response = await client.post(
             "https://api.brevo.com/v3/smtp/email",
             headers={"api-key": BREVO_API_KEY, "accept": "application/json", "content-type": "application/json"},
@@ -398,17 +440,18 @@ Sender display name: {BREVO_SENDER_NAME}
 def create_campaign(payload: CampaignCreateRequest):
     if not BREVO_API_KEY or not BREVO_SENDER_EMAIL:
         raise HTTPException(400, "Brevo is not configured. Check Render environment variables.")
+    attachments = validate_attachments(payload.attachments)
     timestamp = now()
     with db() as con:
         recipients = con.execute("SELECT id FROM contacts WHERE consent=1 ORDER BY id").fetchall()
         if not recipients:
             raise HTTPException(400, "No authorized contacts found. Import contacts and mark permission only where valid consent exists.")
-        cur = con.execute("INSERT INTO campaigns(subject_template,body_template,status,created_at,updated_at) VALUES(?,?, 'queued', ?,?)",
-                          (payload.subject.strip(), payload.body.strip(), timestamp, timestamp))
+        cur = con.execute("INSERT INTO campaigns(subject_template,body_template,status,created_at,updated_at,attachments_json) VALUES(?,?, 'queued', ?,?,?)",
+                          (payload.subject.strip(), payload.body.strip(), timestamp, timestamp, json.dumps(attachments)))
         campaign_id = cur.lastrowid
         con.executemany("INSERT INTO campaign_recipients(campaign_id,contact_id,status,updated_at) VALUES(?,?,'pending',?)",
                         [(campaign_id, r["id"], timestamp) for r in recipients])
-    return {"campaign_id": campaign_id, "total": len(recipients), "status": "queued", "batch_size": min(MAX_SEND_PER_REQUEST, 20)}
+    return {"campaign_id": campaign_id, "total": len(recipients), "status": "queued", "batch_size": min(MAX_SEND_PER_REQUEST, 20), "attachments": [a["name"] for a in attachments]}
 
 @app.get("/api/campaigns/{campaign_id}")
 def get_campaign(campaign_id: int):
@@ -444,12 +487,16 @@ async def process_campaign(campaign_id: int, payload: CampaignProcessRequest):
             con.execute("UPDATE campaign_recipients SET status='sending', error='', updated_at=? WHERE id=?", (now(), row["queue_id"]))
         con.execute("UPDATE campaigns SET status='sending', updated_at=? WHERE id=?", (now(), campaign_id))
         templates = dict(campaign)
+    try:
+        campaign_attachments = json.loads(templates.get("attachments_json") or "[]")
+    except ValueError:
+        campaign_attachments = []
     sent = failed = 0
     for contact in selected:
         subject = personalize_template(templates["subject_template"], contact)
         body = personalize_template(templates["body_template"], contact)
         try:
-            message_id = await send_via_brevo(contact["email"], contact["name"], subject, body)
+            message_id = await send_via_brevo(contact["email"], contact["name"], subject, body, campaign_attachments)
             with db() as con:
                 con.execute("UPDATE campaign_recipients SET status='sent', provider_message_id=?, error='', updated_at=? WHERE id=?",
                             (message_id, now(), contact["queue_id"]))
