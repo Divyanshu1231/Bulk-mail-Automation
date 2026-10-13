@@ -19,3 +19,9 @@ footer{display:flex;gap:20px;flex-wrap:wrap;color:#64748b;font-size:12px;padding
 .attach-list li{display:flex;justify-content:space-between;align-items:center;gap:12px;background:#f1f5f9;border-radius:10px;padding:8px 12px;font-size:14px;word-break:break-all}
 .attach-list em{color:#64748b;font-style:normal}
 .attach-list .attach-total{background:transparent;color:#475569;justify-content:flex-end;padding:0 4px}
+.mode-toggle{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0 12px}
+.ai-error{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-top:12px}
+.ai-error-actions{display:flex;gap:8px;flex-wrap:wrap}
+.ai-error .ai-error-actions button{background:#2563eb;color:#fff;font-size:13px;padding:8px 14px;border-radius:8px}
+.ai-error .ai-error-actions button.secondary{background:#fff;color:#334155;border:1px solid #cbd5e1}
+.ai-error .ai-error-actions button:disabled{opacity:.6}
