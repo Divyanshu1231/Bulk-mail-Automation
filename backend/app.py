@@ -35,8 +35,8 @@ MAX_SEND_PER_REQUEST = max(1, min(int(os.getenv("MAX_SEND_PER_REQUEST", "20")), 
 
 GEMINI_FALLBACK_MODELS = [m.strip() for m in os.getenv("GEMINI_FALLBACK_MODELS", "").split(",") if m.strip() and m.strip() != GEMINI_MODEL]
 GEMINI_MAX_RETRIES = max(0, min(int(os.getenv("GEMINI_MAX_RETRIES", "2")), 5))          # retries after the first attempt
-GEMINI_TOTAL_TIMEOUT = float(os.getenv("GEMINI_TOTAL_TIMEOUT_SECONDS", "45"))            # hard budget per user request
-GEMINI_REQUEST_TIMEOUT = float(os.getenv("GEMINI_REQUEST_TIMEOUT_SECONDS", "25"))        # per HTTP attempt
+GEMINI_TOTAL_TIMEOUT = float(os.getenv("GEMINI_TOTAL_TIMEOUT_SECONDS", "60"))            # hard budget per user request
+GEMINI_REQUEST_TIMEOUT = float(os.getenv("GEMINI_REQUEST_TIMEOUT_SECONDS", "20"))        # per HTTP attempt
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 GEMINI_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 STALE_SENDING_MINUTES = 10
@@ -373,12 +373,19 @@ async def call_gemini(prompt: str) -> tuple[str, str]:
     if not GEMINI_API_KEY:
         raise GeminiError(400, "gemini_not_configured", "GEMINI_API_KEY is not configured. You can still use a manual template.", False)
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + GEMINI_TOTAL_TIMEOUT
+    start = loop.time()
+    overall_deadline = start + GEMINI_TOTAL_TIMEOUT
     models = [GEMINI_MODEL] + GEMINI_FALLBACK_MODELS
     last = None
     for index, model in enumerate(models):
+        # With fallbacks configured, the primary model may only use ~55% of the time budget,
+        # so a configured fallback model always gets a real chance (503 responses can be slow).
+        if index == 0 and len(models) > 1:
+            deadline = start + GEMINI_TOTAL_TIMEOUT * 0.55
+        else:
+            deadline = overall_deadline
         try:
-            text = await _gemini_attempts(model, prompt, deadline, GEMINI_MAX_RETRIES if index == 0 else 0)
+            text = await _gemini_attempts(model, prompt, deadline, GEMINI_MAX_RETRIES if index == 0 else 1)
             if index:
                 logger.warning("Gemini fallback model used: %s (primary %s was unavailable)", model, GEMINI_MODEL)
             else:
@@ -387,8 +394,11 @@ async def call_gemini(prompt: str) -> tuple[str, str]:
         except GeminiError as exc:
             last = exc
             if not exc.transient:
+                if index == 0 and exc.code in ("gemini_model_not_found",) and len(models) > 1:
+                    logger.warning("Primary Gemini model %s not usable (%s); trying configured fallback", model, exc.code)
+                    continue
                 raise
-            if deadline - loop.time() < 1:
+            if overall_deadline - loop.time() < 1:
                 break
     raise last
 
@@ -417,13 +427,17 @@ async def generate_with_gemini(contact: dict, instruction: str) -> tuple[str, st
 async def ai_check():
     """Verify the configured Gemini model exists and supports generateContent (does not use generation quota)."""
     info = {"configured": bool(GEMINI_API_KEY), "model": GEMINI_MODEL, "fallback_models": GEMINI_FALLBACK_MODELS,
-            "supported": None, "detail": ""}
+            "supported": None, "detail": "", "fallbacks": []}
     if not GEMINI_API_KEY:
         info["detail"] = "GEMINI_API_KEY is not configured."
         return info
     try:
         async with httpx.AsyncClient(timeout=15, transport=_gemini_transport) as client:
             response = await client.get(f"{GEMINI_BASE_URL}/models/{GEMINI_MODEL}", headers={"x-goog-api-key": GEMINI_API_KEY})
+            for fb in GEMINI_FALLBACK_MODELS:
+                fb_resp = await client.get(f"{GEMINI_BASE_URL}/models/{fb}", headers={"x-goog-api-key": GEMINI_API_KEY})
+                ok = fb_resp.status_code == 200 and "generateContent" in fb_resp.json().get("supportedGenerationMethods", [])
+                info["fallbacks"].append({"model": fb, "supported": ok if fb_resp.status_code in (200, 404) else None})
     except httpx.HTTPError:
         info["detail"] = "Could not reach Gemini to verify the model."
         return info
@@ -702,4 +716,4 @@ def stats():
         contacts = con.execute("SELECT COUNT(*) n FROM contacts").fetchone()["n"]
         consented = con.execute("SELECT COUNT(*) n FROM contacts WHERE consent=1").fetchone()["n"]
         counts = con.execute("SELECT status, COUNT(*) n FROM drafts GROUP BY status").fetchall()
-    return {"contacts": contacts, "consented_contacts": consented, "drafts": {r["status"]: r["n"] for r in counts}}
+    return {"contacts": contacts, "consented_consents": consented, "drafts": {r["status"]: r["n"] for r in counts}}
