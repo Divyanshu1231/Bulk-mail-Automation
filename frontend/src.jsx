@@ -57,7 +57,7 @@ function App() {
   async function refresh() {
     try {
       const [h, c, s] = await Promise.all([request("/health", {}, 12), request("/contacts", {}, 12), request("/stats", {}, 12)]);
-      setHealth(h); setContacts(c); setStats(s);
+      setHealth(h); setContacts(Array.isArray(c) ? c : []); setStats(s && typeof s === "object" ? s : { contacts: 0, consented_contacts: 0, drafts: {} });
     } catch (e) { setError("Cannot reach backend (Render may still be waking up, retry in a minute). " + e.message); }
   }
   useEffect(() => { refresh(); }, []);
@@ -143,7 +143,7 @@ function App() {
       <div className="action-row"><span>Placeholders: <code>{"{{name}}"}</code> <code>{"{{company}}"}</code> <code>{"{{role}}"}</code></span><button onClick={generateTemplate} disabled={busy}>{busy ? "Working…" : "Generate one template"}</button></div>
       <label className="field-label">Email subject</label><input value={subject} onChange={e => setSubject(e.target.value)} maxLength="250" disabled={busy}/>
       <label className="field-label">Email body</label><textarea rows="10" value={body} onChange={e => setBody(e.target.value)} maxLength="12000" disabled={busy} placeholder="Your reusable email template will appear here…"/>
-      <div className="notice">Example: “Hi {{name}}” will be personalized for each recipient. Do not add claims or facts that you cannot verify.</div>
+      <div className="notice">Example: “Hi {"{{name}}"}” will be personalized for each recipient. Do not add claims or facts that you cannot verify.</div>
     </section>
     <section className="panel">
       <h2>3. Send campaign in batches</h2>
