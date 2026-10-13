@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./style.css";
 
@@ -13,8 +13,12 @@ async function request(path, options = {}, retries = 0) {
       const res = await fetch(API + path, options);
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        const err = new Error(data.detail || `Request failed (${res.status})`);
+        const detail = Array.isArray(data.detail) ? data.detail.map(d => d.msg || "Invalid input").join("; ") : data.detail;
+        const err = new Error(detail || `Request failed (${res.status})`);
         err.status = res.status;
+        err.code = data.code;
+        err.retryable = data.retryable;
+        err.retryAfter = data.retry_after;
         throw err;
       }
       return data;
@@ -62,6 +66,9 @@ function App() {
   const [error, setError] = useState("");
   const [progress, setProgress] = useState(null);
   const [files, setFiles] = useState([]);
+  const [mode, setMode] = useState("ai");          // "ai" = generate with Gemini, "manual" = type your own template
+  const [aiError, setAiError] = useState(null);    // { message, retryable, retryAfter }
+  const sendLock = useRef(false);                  // blocks double-click / duplicate campaigns
 
   async function refresh() {
     try {
@@ -112,36 +119,46 @@ function App() {
     } catch (err) { showError(err); } finally { setBusy(false); }
   }
   async function generateTemplate() {
-    setBusy(true); setError(""); setMessage("");
+    if (busy) return;
+    setBusy(true); setError(""); setMessage(""); setAiError(null);
     try {
       const result = await request("/template/generate", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ instruction }) });
-      setSubject(result.subject); setBody(result.body);
-      setMessage("One reusable template generated. Review and edit it before sending.");
-    } catch (err) { showError(err); } finally { setBusy(false); }
+      setSubject(result.subject); setBody(result.body);   // only overwritten on success; typed text is kept on failure
+      setMessage(`One reusable template generated${result.model ? ` (${result.model})` : ""}. Review and edit it before sending.`);
+    } catch (err) {
+      const retryable = err.retryable !== undefined ? err.retryable : !err.status;   // network errors are retryable
+      setAiError({ message: err.message, retryable, retryAfter: err.retryAfter });
+    } finally { setBusy(false); }
   }
   async function sendCampaign() {
-    if (!subject.trim() || !body.trim()) { setError("Generate or enter a subject and email body first."); return; }
+    if (sendLock.current) return;
+    if (!subject.trim() || !body.trim()) { setError("Subject and email body are required. Type them yourself (Manual Template) or generate them with AI."); return; }
     if (!stats.consented_contacts) { setError("No authorized contacts. Import contacts and mark permission only when valid consent exists."); return; }
     const confirmed = window.confirm(`Start one bulk campaign for ${stats.consented_contacts} authorized contact(s)?\n\nGemini will NOT generate a separate draft per contact. The same template will be personalized with {{name}}, {{company}}, {{role}} and sent in batches.${files.length ? `\n\nAttachments (${files.length}): ${files.map(f => f.name).join(", ")}` : ""}\n\nContinue only if these recipients are authorized and your Brevo plan supports the volume.`);
     if (!confirmed) return;
+    sendLock.current = true;
+    const requestId = (window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`).slice(0, 64);
     setBusy(true); setError(""); setMessage(""); setProgress({ sent: 0, failed: 0, pending: stats.consented_contacts, total: stats.consented_contacts });
     try {
       const attachments = await Promise.all(files.map(async f => ({ name: f.name, content: await fileToBase64(f) })));
-      const campaign = await request("/campaigns", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ subject, body, attachments }) });
+      const campaign = await request("/campaigns", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ subject, body, attachments, request_id: requestId }) });
       let latest = { sent: 0, failed: 0, pending: campaign.total, total: campaign.total };
+      let firstError = "";
       setProgress(latest);
       // Process one small batch per request so a single long HTTP request doesn't handle all 5,000 recipients.
       while (true) {
         const batch = await request(`/campaigns/${campaign.campaign_id}/process`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ limit: campaign.batch_size || 20 }) });
         latest = { sent: batch.sent || 0, failed: batch.failed || 0, pending: batch.pending || 0, total: campaign.total };
         setProgress(latest);
+        if (!firstError && batch.errors?.length) firstError = `${batch.errors[0].email}: ${batch.errors[0].error}`;
         if (batch.done) break;
         if (!batch.processed && latest.pending > 0) throw new Error("Campaign made no progress. Check Render logs and retry after resolving the error.");
       }
       setMessage(`Campaign finished. Accepted by Brevo: ${latest.sent}; failed: ${latest.failed}. Check the campaign results before retrying failed recipients.`);
+      if (latest.failed > 0 && firstError) setError(`Email fail hua. Reason: ${firstError}`);
       await refresh();
     } catch (err) { showError(err); }
-    finally { setBusy(false); }
+    finally { setBusy(false); sendLock.current = false; }
   }
 
   const consented = contacts.filter(c => c.consent).length;
@@ -169,9 +186,24 @@ function App() {
     </section>
     <section className="panel">
       <h2>2. Create one email template</h2>
-      <p>Gemini is called once to create a reusable template, not once per contact. You can edit the subject and body before sending.</p>
-      <label className="field-label">Instructions to AI</label><textarea rows="3" value={instruction} onChange={e => setInstruction(e.target.value)} disabled={busy}/>
-      <div className="action-row"><span>Placeholders: <code>{"{{name}}"}</code> <code>{"{{company}}"}</code> <code>{"{{role}}"}</code></span><button onClick={generateTemplate} disabled={busy}>{busy ? "Working…" : "Generate one template"}</button></div>
+      <div className="mode-toggle">
+        <button className={mode === "ai" ? "" : "secondary"} onClick={() => { setMode("ai"); setAiError(null); }} disabled={busy}>Generate with AI</button>
+        <button className={mode === "manual" ? "" : "secondary"} onClick={() => { setMode("manual"); setAiError(null); }} disabled={busy}>Use Manual Template</button>
+      </div>
+      {mode === "ai" ? <>
+        <p>Gemini is called once to create a reusable template, not once per contact. You can edit the subject and body before sending.</p>
+        <label className="field-label">Instructions to AI</label><textarea rows="3" value={instruction} onChange={e => setInstruction(e.target.value)} disabled={busy}/>
+        <div className="action-row"><span>Placeholders: <code>{"{{name}}"}</code> <code>{"{{email}}"}</code> <code>{"{{company}}"}</code> <code>{"{{role}}"}</code> <code>{"{{context}}"}</code></span><button onClick={generateTemplate} disabled={busy}>{busy ? "Working…" : "Generate one template"}</button></div>
+        {aiError && <div className="alert error ai-error">
+          <div><b>AI template could not be generated.</b> {aiError.message}{aiError.retryAfter ? ` (try again in about ${aiError.retryAfter}s)` : ""}<br/>Your typed subject and body are kept. You can send a campaign without AI.</div>
+          <div className="ai-error-actions">
+            {aiError.retryable && <button onClick={generateTemplate} disabled={busy}>Retry</button>}
+            <button className="secondary" onClick={() => { setMode("manual"); setAiError(null); }} disabled={busy}>Use Manual Template</button>
+          </div>
+        </div>}
+      </> : <>
+        <p>Manual mode: Gemini is not used. Type your own subject and body below. Placeholders are filled in for each contact when sending: <code>{"{{name}}"}</code> <code>{"{{email}}"}</code> <code>{"{{company}}"}</code> <code>{"{{role}}"}</code> <code>{"{{context}}"}</code></p>
+      </>}
       <label className="field-label">Email subject</label><input value={subject} onChange={e => setSubject(e.target.value)} maxLength="250" disabled={busy}/>
       <label className="field-label">Email body</label><textarea rows="10" value={body} onChange={e => setBody(e.target.value)} maxLength="12000" disabled={busy} placeholder="Your reusable email template will appear here…"/>
       <label className="field-label">Attachments (optional, photo ya file)</label>
