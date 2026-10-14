@@ -716,4 +716,4 @@ def stats():
         contacts = con.execute("SELECT COUNT(*) n FROM contacts").fetchone()["n"]
         consented = con.execute("SELECT COUNT(*) n FROM contacts WHERE consent=1").fetchone()["n"]
         counts = con.execute("SELECT status, COUNT(*) n FROM drafts GROUP BY status").fetchall()
-    return {"contacts": contacts, "consented_consents": consented, "drafts": {r["status"]: r["n"] for r in counts}}
+    return {"contacts": contacts, "consented_contacts": consented, "drafts": {r["status"]: r["n"] for r in counts}}
