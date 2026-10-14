@@ -77,7 +77,7 @@ function App() {
     } catch (e) { setError("Cannot reach backend (Render may still be waking up, retry in a minute). " + e.message); }
   }
   useEffect(() => { refresh(); }, []);
-  function showError(e) { setError(e.message || String(e)); setMessage(""); }
+  function showError(e) { setError(e.message || String(e)); setMessage(""); window.scrollTo?.({ top: 0, behavior: "smooth" }); }
 
   const maxFiles = health?.max_attachments || 5;
   const maxBytes = (health?.max_attachment_mb || 3) * 1024 * 1024;
@@ -132,13 +132,20 @@ function App() {
   }
   async function sendCampaign() {
     if (sendLock.current) return;
-    if (!subject.trim() || !body.trim()) { setError("Subject and email body are required. Type them yourself (Manual Template) or generate them with AI."); return; }
-    if (!stats.consented_contacts) { setError("No authorized contacts. Import contacts and mark permission only when valid consent exists."); return; }
-    const confirmed = window.confirm(`Start one bulk campaign for ${stats.consented_contacts} authorized contact(s)?\n\nGemini will NOT generate a separate draft per contact. The same template will be personalized with {{name}}, {{company}}, {{role}} and sent in batches.${files.length ? `\n\nAttachments (${files.length}): ${files.map(f => f.name).join(", ")}` : ""}\n\nContinue only if these recipients are authorized and your Brevo plan supports the volume.`);
+    if (!subject.trim() || !body.trim()) { showError(new Error("Subject and email body are required. Type them yourself (Manual Template) or generate them with AI.")); return; }
+    // Fresh check from the backend: the page may be stale if the Render free instance restarted (its SQLite data resets).
+    let authorized = stats.consented_contacts;
+    try {
+      const fresh = await request("/stats");
+      authorized = fresh.consented_contacts || 0;
+      if (authorized !== stats.consented_contacts) await refresh();
+    } catch (err) { showError(err); return; }
+    if (!authorized) { showError(new Error("Backend me koi authorized contact nahi hai. Render free plan restart par data reset ho jata hai. CSV dobara upload karo aur 'I have permission' lagao.")); return; }
+    const confirmed = window.confirm(`Start one bulk campaign for ${authorized} authorized contact(s)?\n\nGemini will NOT generate a separate draft per contact. The same template will be personalized with {{name}}, {{company}}, {{role}} and sent in batches.${files.length ? `\n\nAttachments (${files.length}): ${files.map(f => f.name).join(", ")}` : ""}\n\nContinue only if these recipients are authorized and your Brevo plan supports the volume.`);
     if (!confirmed) return;
     sendLock.current = true;
     const requestId = (window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`).slice(0, 64);
-    setBusy(true); setError(""); setMessage(""); setProgress({ sent: 0, failed: 0, pending: stats.consented_contacts, total: stats.consented_contacts });
+    setBusy(true); setError(""); setMessage(""); setProgress({ sent: 0, failed: 0, pending: authorized, total: authorized });
     try {
       const attachments = await Promise.all(files.map(async f => ({ name: f.name, content: await fileToBase64(f) })));
       const campaign = await request("/campaigns", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ subject, body, attachments, request_id: requestId }) });
@@ -155,7 +162,7 @@ function App() {
         if (!batch.processed && latest.pending > 0) throw new Error("Campaign made no progress. Check Render logs and retry after resolving the error.");
       }
       setMessage(`Campaign finished. Accepted by Brevo: ${latest.sent}; failed: ${latest.failed}. Check the campaign results before retrying failed recipients.`);
-      if (latest.failed > 0 && firstError) setError(`Email fail hua. Reason: ${firstError}`);
+      if (latest.failed > 0 && firstError) showError(new Error(`Email fail hua. Reason: ${firstError}`));
       await refresh();
     } catch (err) { showError(err); }
     finally { setBusy(false); sendLock.current = false; }
@@ -220,6 +227,7 @@ function App() {
     <section className="panel">
       <h2>3. Send campaign in batches</h2>
       <p>Only authorized contacts are queued. Each request processes up to {Math.min(health?.max_send_per_request || 20, 20)} emails to avoid one giant request. Sending 5,000 emails still depends on your provider's daily quota and account limits.</p>
+      {error && <div className="alert error"><span><b>Problem:</b> {error}</span><button onClick={() => setError("")}>×</button></div>}
       <button onClick={sendCampaign} disabled={busy || !subject.trim() || !body.trim() || !consented}>{busy ? "Campaign processing…" : `Send to ${consented} authorized contact(s)`}</button>
       {progress && <div style={{marginTop:16}}><strong>Campaign progress</strong><p>Sent: {progress.sent} · Failed: {progress.failed} · Pending: {progress.pending} / {progress.total}</p><div style={{height:10,background:"#e5e7eb",borderRadius:99,overflow:"hidden"}}><div style={{height:"100%",width:`${progress.total ? ((progress.sent + progress.failed) / progress.total) * 100 : 0}%`,background:"#2563eb",transition:"width .2s"}}/></div></div>}
       <div className="notice">Failed emails are recorded in the campaign queue and are not automatically retried, to avoid duplicate sends. “Accepted by Brevo” does not guarantee inbox delivery.</div>
