@@ -532,7 +532,15 @@ async def send_via_brevo(email: str, name: str, subject: str, body: str, attachm
             json=payload
         )
     if response.status_code >= 400:
-        raise RuntimeError(f"Brevo {response.status_code}: {response.text[:800]}")
+        text = response.text[:800]
+        if response.status_code == 401 and "unrecognised IP" in text:
+            found = re.search(r"IP address ([0-9a-fA-F:.]+)", text)
+            ip = found.group(1).rstrip(".") if found else "unknown"
+            raise RuntimeError(
+                f"Brevo blocked this server's IP address ({ip}). Fix: in Brevo open Security > Authorised IPs "
+                f"(https://app.brevo.com/security/authorised_ips) and deactivate IP blocking, because Render's IP changes. "
+                f"Brevo said: {text}")
+        raise RuntimeError(f"Brevo {response.status_code}: {text}")
     return response.json().get("messageId", "")
 
 def personalize_template(template: str, contact: dict) -> str:
