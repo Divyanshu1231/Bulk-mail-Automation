@@ -134,11 +134,11 @@ function App() {
     if (sendLock.current) return;
     if (!subject.trim() || !body.trim()) { showError(new Error("Subject and email body are required. Type them yourself (Manual Template) or generate them with AI.")); return; }
     // Fresh check from the backend: the page may be stale if the Render free instance restarted (its SQLite data resets).
-    let authorized = stats.consented_contacts;
+    let authorized = contacts.filter(c => c.consent).length;
     try {
-      const fresh = await request("/stats");
-      authorized = fresh.consented_contacts || 0;
-      if (authorized !== stats.consented_contacts) await refresh();
+      const freshContacts = await request("/contacts");
+      const fresh = Array.isArray(freshContacts) ? freshContacts.filter(c => c.consent).length : 0;
+      if (fresh !== authorized) { authorized = fresh; await refresh(); }
     } catch (err) { showError(err); return; }
     if (!authorized) { showError(new Error("Backend me koi authorized contact nahi hai. Render free plan restart par data reset ho jata hai. CSV dobara upload karo aur 'I have permission' lagao.")); return; }
     const confirmed = window.confirm(`Start one bulk campaign for ${authorized} authorized contact(s)?\n\nGemini will NOT generate a separate draft per contact. The same template will be personalized with {{name}}, {{company}}, {{role}} and sent in batches.${files.length ? `\n\nAttachments (${files.length}): ${files.map(f => f.name).join(", ")}` : ""}\n\nContinue only if these recipients are authorized and your Brevo plan supports the volume.`);
