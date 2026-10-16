@@ -24,8 +24,12 @@ load_dotenv()
 DB_PATH = os.getenv("DATABASE_PATH", "./email_automation.db")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest").strip()
-BREVO_API_KEY = os.getenv("BREVO_API_KEY", "").strip()
-BREVO_SENDER_EMAIL = os.getenv("BREVO_SENDER_EMAIL", "").strip()
+def _clean_env(name: str, default: str = "") -> str:
+    """Env values pasted into dashboards often carry spaces, newlines or quotes; remove them."""
+    return os.getenv(name, default).strip().strip("\"'").strip()
+
+BREVO_API_KEY = _clean_env("BREVO_API_KEY")
+BREVO_SENDER_EMAIL = _clean_env("BREVO_SENDER_EMAIL")
 BREVO_SENDER_NAME = os.getenv("BREVO_SENDER_NAME", "Recruitment Team").strip()
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "https://bulk-mail-frontend.onrender.com").strip().rstrip("/")
 _DEFAULT_CORS = f"{FRONTEND_ORIGIN},http://localhost:5173,http://127.0.0.1:5173"
@@ -46,6 +50,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)      # httpx INFO logs prin
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 _gemini_transport = None   # tests inject an httpx.MockTransport here
+_brevo_transport = None    # same for Brevo checks
 _sleep = asyncio.sleep     # tests replace this to avoid real waiting
 
 MAX_ATTACHMENTS = 5
@@ -525,7 +530,7 @@ async def send_via_brevo(email: str, name: str, subject: str, body: str, attachm
     }
     if attachments:
         payload["attachment"] = [{"name": a["name"], "content": a["content"]} for a in attachments]
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=60, transport=_brevo_transport) as client:
         response = await client.post(
             "https://api.brevo.com/v3/smtp/email",
             headers={"api-key": BREVO_API_KEY, "accept": "application/json", "content-type": "application/json"},
@@ -542,6 +547,64 @@ async def send_via_brevo(email: str, name: str, subject: str, body: str, attachm
                 f"Brevo said: {text}")
         raise RuntimeError(f"Brevo {response.status_code}: {text}")
     return response.json().get("messageId", "")
+
+@app.get("/api/brevo/check")
+async def brevo_check():
+    """Diagnose the Brevo setup without sending any email. Never returns the full API key."""
+    key = BREVO_API_KEY
+    info = {
+        "api_key_configured": bool(key),
+        "api_key_length": len(key),
+        "api_key_hint": f"{key[:8]}...{key[-3:]}" if len(key) >= 12 else "",
+        "api_key_starts_with_xkeysib": key.startswith("xkeysib-"),
+        "api_key_valid": None,
+        "account_email": "",
+        "sender_email": BREVO_SENDER_EMAIL,
+        "sender_found": None,
+        "sender_active": None,
+        "detail": [],
+    }
+    if not key:
+        info["detail"].append("BREVO_API_KEY is empty on the backend.")
+        return info
+    if not key.startswith("xkeysib-"):
+        info["detail"].append("Brevo v3 API keys usually start with 'xkeysib-'. This key does not; an SMTP key or a different value may have been pasted.")
+    headers = {"api-key": key, "accept": "application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=20, transport=_brevo_transport) as client:
+            account = await client.get("https://api.brevo.com/v3/account", headers=headers)
+            if account.status_code == 200:
+                info["api_key_valid"] = True
+                info["account_email"] = account.json().get("email", "")
+                senders = await client.get("https://api.brevo.com/v3/senders", headers=headers)
+                if senders.status_code == 200:
+                    wanted = BREVO_SENDER_EMAIL.lower()
+                    match = next((x for x in senders.json().get("senders", []) if str(x.get("email", "")).lower() == wanted), None)
+                    info["sender_found"] = bool(match)
+                    info["sender_active"] = bool(match.get("active")) if match else None
+                    if not match:
+                        info["detail"].append(f"Sender '{BREVO_SENDER_EMAIL}' is not in this Brevo account's Senders list. Add and verify it in Brevo > Senders.")
+                    elif not match.get("active"):
+                        info["detail"].append(f"Sender '{BREVO_SENDER_EMAIL}' exists but is not active/verified in Brevo.")
+                else:
+                    info["detail"].append(f"Could not read the senders list (HTTP {senders.status_code}).")
+            else:
+                info["api_key_valid"] = False
+                try:
+                    message = account.json().get("message", "")
+                except ValueError:
+                    message = account.text[:200]
+                info["brevo_status"] = account.status_code
+                info["brevo_message"] = message
+                if "unrecognised IP" in message:
+                    info["detail"].append("The key is probably fine, but Brevo blocks this server's IP. Brevo > Settings > Security > Authorized IPs > deactivate blocking for API keys.")
+                elif "Key not found" in message:
+                    info["detail"].append("Brevo does not recognise this key. It was deleted/regenerated, belongs to another Brevo account, or is not a v3 API key.")
+                else:
+                    info["detail"].append(f"Brevo rejected the key (HTTP {account.status_code}).")
+    except httpx.HTTPError as exc:
+        info["detail"].append(f"Could not reach Brevo ({type(exc).__name__}).")
+    return info
 
 def personalize_template(template: str, contact: dict) -> str:
     values = {
